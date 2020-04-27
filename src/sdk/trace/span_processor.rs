@@ -131,7 +131,7 @@ impl api::SpanProcessor for SimpleSpanProcessor {
 }
 
 /// A [`SpanProcessor`] that asynchronously buffers finished spans and reports
-/// them at a preconfigured interval.
+/// them when the batch is full or times out.
 ///
 /// [`SpanProcessor`]: ../../../api/trace/span_processor/trait.SpanProcessor.html
 #[derive(Debug)]
@@ -170,6 +170,21 @@ pub struct BatchSpanProcessorWorker {
     buffer: Vec<Arc<exporter::trace::SpanData>>,
 }
 
+impl BatchSpanProcessorWorker {
+    fn export_current_spans(&mut self) {
+        if !self.buffer.is_empty() {
+            let mut spans = std::mem::replace(&mut self.buffer, Vec::new());
+            while !spans.is_empty() {
+                let batch_idx = spans
+                    .len()
+                    .saturating_sub(self.config.max_export_batch_size);
+                let batch = spans.split_off(batch_idx);
+                self.exporter.export(batch);
+            }
+        }
+    }
+}
+
 impl Future for BatchSpanProcessorWorker {
     type Output = ();
 
@@ -178,25 +193,19 @@ impl Future for BatchSpanProcessorWorker {
             match futures::ready!(self.messages.poll_next_unpin(cx)) {
                 // Span has finished, add to buffer of pending spans.
                 Some(BatchMessage::ExportSpan(span)) => {
-                    if self.buffer.len() < self.config.max_queue_size {
-                        self.buffer.push(span);
+                    self.buffer.push(span);
+
+                    if self.buffer.len() >= self.config.max_export_batch_size {
+                        self.export_current_spans();
                     }
                 }
                 // Span batch interval time reached, export current spans.
                 Some(BatchMessage::Tick) => {
-                    if !self.buffer.is_empty() {
-                        let mut spans = std::mem::replace(&mut self.buffer, Vec::new());
-                        while !spans.is_empty() {
-                            let batch_idx = spans
-                                .len()
-                                .saturating_sub(self.config.max_export_batch_size);
-                            let batch = spans.split_off(batch_idx);
-                            self.exporter.export(batch);
-                        }
-                    }
+                    self.export_current_spans();
                 }
                 // Stream has terminated or processor is shutdown, return to finish execution.
                 None | Some(BatchMessage::Shutdown) => {
+                    self.export_current_spans();
                     self.exporter.shutdown();
                     return Poll::Ready(());
                 }
